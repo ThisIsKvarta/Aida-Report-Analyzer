@@ -1,0 +1,22 @@
+# Исключения для Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.spec
+venv/
+.venv/
+
+# Исключения для PyInstaller
+build/
+dist/
+
+# Исключения для нашего проекта
+*.xlsx
+*.log
+debug_output.txt
+reports/
+
+# Системные файлы Windows/macOS
+.DS_Store
+Thumbs.db
