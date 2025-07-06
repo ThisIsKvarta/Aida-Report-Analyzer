@@ -5,7 +5,7 @@ import logging
 import configparser
 from datetime import datetime
 from bs4 import BeautifulSoup, Tag
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.cell import MergedCell
@@ -14,18 +14,74 @@ from PySide6.QtCore import QObject, Signal
 
 logger = logging.getLogger(__name__)
 
-# Константы, используемые в обоих модулях
+# Разделенные заголовки для разных вкладок и служебная колонка
 HEADERS_MAIN = [
-    'Кабинет', 'Имя файла', 'Локальный IP', 'ОС', 'Процессор', 'Сокет',
+    'Название ПК', 'Имя файла', 'ОС', 'Процессор', 'Сокет',
     'Материнская плата', 'Видеоадаптер', 'Монитор', 'Принтеры', 'Объем ОЗУ',
     'Кол-во плашек ОЗУ', 'Свободно слотов ОЗУ', 'Модели плашек ОЗУ',
-    'Дисковые накопители', 'SMART Статус', 'Дата BIOS'
+    'Дисковые накопители', 'SMART Статус', 'Дата BIOS', '_RAW_DATA'
 ]
-HEADERS_ANALYSIS = ['Имя файла', 'Кабинет', 'Ключевые проблемы', 'Рекомендация']
+HEADERS_NETWORK = [
+    'Название ПК', 'Имя файла', 'Локальный IP', 'MAC-адрес'
+]
+HEADERS_ANALYSIS = ['Имя файла', 'Название ПК', 'Ключевые проблемы', 'Рекомендация']
 CRITICAL_SMART_ATTRIBUTES = {'05', 'C5', 'C6'}
 
 def natural_sort_key(s):
     return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
+
+class ExcelReaderWorker(QObject):
+    log_message = Signal(str, str)
+    progress_update = Signal(int, int)
+    result_ready = Signal(dict)
+    finished = Signal(str)
+
+    def __init__(self, filepath):
+        super().__init__()
+        self.filepath = filepath
+
+    def run(self): # <- это внутри ExcelReaderWorker
+        try:
+            self.log_message.emit(f"Загрузка данных из {os.path.basename(self.filepath)}...", "info")
+            wb = load_workbook(self.filepath)
+            # ВНИМАНИЕ: get_sheet_by_name устарел, используем wb['название']
+            ws = wb["Все данные"]
+            
+            headers = [cell.value for cell in ws[1]]
+            
+            try:
+                headers.index('_RAW_DATA')
+            except ValueError:
+                self.log_message.emit("Ошибка: В файле Excel отсутствует служебная колонка. Запустите анализ заново.", "error")
+                self.finished.emit(""); return
+            
+            total_rows = ws.max_row - 1
+            if total_rows <= 0:
+                self.log_message.emit("Файл Excel пуст.", "warning")
+                self.finished.emit(self.filepath); return
+
+            for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), 1):
+                data_row = dict(zip(headers, row))
+                raw_data_str = data_row.get('_RAW_DATA')
+                if not raw_data_str: continue
+
+                try:
+                    parts = raw_data_str.split('|')
+                    data_row['category'] = int(parts[0])
+                    data_row['_internal_smart_status'] = parts[1]
+                    data_row['SMART Проблемы'] = parts[2:]
+                except (IndexError, ValueError):
+                    continue
+                
+                self.result_ready.emit(data_row)
+                self.progress_update.emit(row_idx, total_rows)
+
+            self.finished.emit(self.filepath)
+        except Exception as e:
+            self.log_message.emit(f"Ошибка при чтении Excel: {e}", "error")
+            logger.error(f"Ошибка при чтении Excel: {e}", exc_info=True)
+            self.finished.emit("")
+
 
 class AidaWorker(QObject):
     log_message = Signal(str, str)
@@ -57,7 +113,8 @@ class AidaWorker(QObject):
                 data = self.parse_aida_report(file_path)
                 if data:
                     category, problems = self.analyze_system(data)
-                    data['category'] = category; data['problems'] = problems
+                    data['category'] = category
+                    data['problems'] = problems
                     self.result_ready.emit(data)
                     all_reports_data.append(data)
             
@@ -77,29 +134,26 @@ class AidaWorker(QObject):
 
     def find_value_by_label(self, search_area, label_text):
         if not search_area:
-            return 'Не найдено'
+            return None
         try:
             candidates = search_area.find_all(
                 lambda tag: tag.name == 'td' and label_text in tag.get_text() and not tag.find('td')
             )
             if not candidates:
-                return 'Не найдено'
-
+                return None
             label_td = candidates[-1]
             value_td = label_td.find_next_sibling('td')
             if not value_td:
                 value_td = label_td.find_next('td')
-            
             if value_td:
                 link = value_td.find('a')
                 if link:
                     return link.get_text(strip=True)
                 return value_td.get_text(strip=True)
-
-            return 'Не найдено'
+            return None
         except Exception as e:
             logger.error(f"Ошибка в find_value_by_label для '{label_text}': {e}", exc_info=True)
-            return 'Не найдено'
+            return None
 
     def parse_smart_data(self, soup):
         smart_section = soup.find('a', {'name': 'smart'})
@@ -116,7 +170,7 @@ class AidaWorker(QObject):
                 if len(cells) > 3:
                     attr_id = cells[2].get_text(strip=True); attr_desc = cells[3].get_text(strip=True); raw_data_str = cells[-2].get_text(strip=True)
                     try:
-                        raw_data_val = int(raw_data_str)
+                        raw_data_val = int(raw_data_str, 16) if 'x' in raw_data_str else int(raw_data_str)
                         if attr_id in CRITICAL_SMART_ATTRIBUTES and raw_data_val > 0: has_bad_status = True; all_problems.append(f"{drive_name}: {attr_desc} ({attr_id}) > 0")
                         elif attr_id == 'C2' and raw_data_val > temp_warn: has_ok_status = True; all_problems.append(f"{drive_name}: Высокая t° ({raw_data_val}°C)")
                         elif attr_id == '09' and raw_data_val > power_on_warn: has_ok_status = True; all_problems.append(f"{drive_name}: Большой налет часов")
@@ -128,143 +182,140 @@ class AidaWorker(QObject):
         return "GOOD", []
 
     def analyze_system(self, data):
-        problems = []; smart_status = data.get('SMART Статус', "Не найден")
-        if smart_status == "BAD": return 1, "; ".join(data.get('SMART Проблемы', ["Критическая ошибка диска"]))
-        if smart_status == "OK": problems.extend(data.get('SMART Проблемы', []))
-        bios_age_limit = self.config.getint('Analysis', 'bios_age_limit_years', fallback=5); ram_critical_gb = self.config.getfloat('Analysis', 'ram_critical_gb', fallback=3.8); ram_upgrade_gb = self.config.getfloat('Analysis', 'ram_upgrade_gb', fallback=7.8)
-        os_ver, cpu, socket = data.get('ОС',''), data.get('Процессор',''), data.get('Сокет',''); ram_gb_str = re.search(r'(\d+)\s*МБ', data.get('Объем ОЗУ', '0 МБ')); ram_gb = int(ram_gb_str.group(1)) / 1024 if ram_gb_str else 0; gpu_driver, bios_date_str = data.get('Видеоадаптер',''), data.get('Дата BIOS',''); has_ssd = any(k in data.get('Дисковые накопители','').lower() for k in ['ssd','nvme','snv']) or ('kingston' in data.get('Дисковые накопители','').lower() and 'datatraveler' not in data.get('Дисковые накопители','').lower())
+        problems = []
+        smart_status = data.get('SMART Статус', "Не найден")
+        if smart_status == "BAD":
+            return 1, "; ".join(data.get('SMART Проблемы', ["Критическая ошибка диска"]))
+        if smart_status == "OK":
+            problems.extend(data.get('SMART Проблемы', []))
+        
+        bios_age_limit = self.config.getint('Analysis', 'bios_age_limit_years', fallback=5)
+        ram_critical_gb = self.config.getfloat('Analysis', 'ram_critical_gb', fallback=3.8)
+        ram_upgrade_gb = self.config.getfloat('Analysis', 'ram_upgrade_gb', fallback=7.8)
+        disk_c_critical_gb = self.config.getfloat('Analysis', 'disk_c_critical_gb', fallback=15.0)
+
+        os_ver, cpu, socket = data.get('ОС'), data.get('Процессор'), data.get('Сокет')
+        ram_gb_str = re.search(r'(\d+)\s*МБ', data.get('Объем ОЗУ') or '')
+        ram_gb = int(ram_gb_str.group(1)) / 1024 if ram_gb_str else 0
+        gpu_driver = data.get('Видеоадаптер')
+        bios_date_str = data.get('Дата BIOS')
+        has_ssd = any(k in (data.get('Дисковые накопители') or '').lower() for k in ['ssd', 'nvme', 'snv'])
+        disk_c_free_gb = data.get('Disk_C_Free_GB', -1)
+
         is_critical = False
-        if 'LGA775' in socket: is_critical=True; problems.append("Очень старый сокет (LGA775)")
-        if ram_gb > 0 and ram_gb < ram_critical_gb: is_critical=True; problems.append(f"Критически мало ОЗУ ({ram_gb:.1f} ГБ)")
-        if 'Windows 7' in os_ver and any(p in cpu for p in ['G3','G1','E5','i3-2','i3-3','FX']): is_critical=True; problems.append("Устаревшая ОС на очень слабом ЦП")
-        if is_critical: return 1, "; ".join(problems)
+        if socket and 'LGA775' in socket:
+            is_critical=True; problems.append("Очень старый сокет (LGA775)")
+        if ram_gb > 0 and ram_gb < ram_critical_gb:
+            is_critical=True; problems.append(f"Критически мало ОЗУ ({ram_gb:.1f} ГБ)")
+        if os_ver and 'Windows 7' in os_ver and cpu and any(p in cpu for p in ['G3','G1','E5','i3-2','i3-3','FX']):
+            is_critical=True; problems.append("Устаревшая ОС на очень слабом ЦП")
+        
+        if is_critical:
+            return 1, "; ".join(problems)
+
         is_upgrade_needed = len(problems) > 0
-        if 'Windows 7' in os_ver: is_upgrade_needed=True; problems.append("Устаревшая ОС Windows 7")
-        if ram_critical_gb <= ram_gb < ram_upgrade_gb: is_upgrade_needed=True; problems.append(f"Недостаточно ОЗУ ({ram_gb:.1f} ГБ)")
-        if not has_ssd: is_upgrade_needed=True; problems.append("Отсутствует SSD")
-        if 'Microsoft Basic Display Adapter' in gpu_driver: is_upgrade_needed=True; problems.append("Не установлен видеодрайвер")
-        if bios_date_str and bios_date_str != 'Не найдено':
+        if os_ver and 'Windows 7' in os_ver:
+            is_upgrade_needed=True; problems.append("Устаревшая ОС Windows 7")
+        if ram_critical_gb <= ram_gb < ram_upgrade_gb:
+            is_upgrade_needed=True; problems.append(f"Недостаточно ОЗУ ({ram_gb:.1f} ГБ)")
+        if not has_ssd:
+            is_upgrade_needed=True; problems.append("Отсутствует SSD")
+        if gpu_driver and 'Microsoft Basic Display Adapter' in gpu_driver:
+            is_upgrade_needed=True; problems.append("Не установлен видеодрайвер")
+        if disk_c_free_gb != -1 and disk_c_free_gb < disk_c_critical_gb:
+            is_upgrade_needed=True; problems.append(f"Мало места на диске C: ({disk_c_free_gb:.1f} ГБ)")
+
+        if bios_date_str:
             try:
                 date_match = re.search(r'(\d{2}/\d{2}/\d{2,4})', bios_date_str)
                 if date_match:
                     date_str_extracted = date_match.group(1)
-                    bios_date_format = '%d/%m/%Y' if len(date_str_extracted) > 8 else '%d/%m/%y'
+                    bios_date_format = '%m/%d/%Y' if int(date_match.group(1).split('/')[0]) <= 12 and int(date_match.group(1).split('/')[1]) <= 31 else '%d/%m/%Y'
+                    if len(date_str_extracted.split('/')[-1]) == 2:
+                        bios_date_format = bios_date_format.replace('Y', 'y')
                     bios_date = datetime.strptime(date_str_extracted, bios_date_format)
                     if (datetime.now() - bios_date).days > 365 * bios_age_limit:
-                        is_upgrade_needed=True
-                        problems.append(f"BIOS старше {bios_age_limit} лет")
-            except ValueError: pass
-        if is_upgrade_needed: return 2, "; ".join(problems)
+                        is_upgrade_needed=True; problems.append(f"BIOS старше {bios_age_limit} лет")
+            except (ValueError, IndexError): pass
+
+        if is_upgrade_needed:
+            return 2, "; ".join(problems)
+
         return 3, "Состояние хорошее"
-        
+    
     def parse_aida_report(self, file_path):
         self.log_message.emit(f"Обработка: {os.path.basename(file_path)}", "info")
         try:
             with open(file_path, 'r', encoding='windows-1251', errors='ignore') as f:
                 html_content = f.read()
-            # lxml лучше справляется с "битым" HTML
             soup = BeautifulSoup(html_content, 'lxml')
+            data = {'Имя файла': os.path.basename(file_path)}
 
-            # --- Возвращаемся к правильной логике: каждому разделу - своя таблица ---
             summary_section = soup.find('a', {'name': 'summary'})
             summary_table = summary_section.find_next('table') if summary_section else None
+
+            if summary_table:
+                data['Название ПК'] = self.find_value_by_label(summary_table, 'Имя компьютера') or ''
+                data['ОС'] = self.find_value_by_label(summary_table, 'Операционная система') or ''
+                data['Процессор'] = self.find_value_by_label(summary_table, 'Тип ЦП') or ''
+                data['Материнская плата'] = self.find_value_by_label(summary_table, 'Системная плата') or ''
+                data['Видеоадаптер'] = self.find_value_by_label(summary_table, 'Видеоадаптер') or ''
+                data['Монитор'] = self.find_value_by_label(summary_table, 'Монитор') or ''
+                data['Объем ОЗУ'] = self.find_value_by_label(summary_table, 'Системная память') or ''
+                data['Локальный IP'] = self.find_value_by_label(summary_table, 'Первичный адрес IP') or ''
+                data['MAC-адрес'] = self.find_value_by_label(summary_table, 'Первичный адрес MAC') or ''
+                disk_c_text = self.find_value_by_label(summary_table, 'C: (NTFS)')
+                if disk_c_text:
+                    match = re.search(r'\((\d+)\s*МБ\s*свободно\)', disk_c_text)
+                    if match:
+                        free_mb = int(match.group(1))
+                        data['Disk_C_Free_GB'] = round(free_mb / 1024, 1)
+                ram_candidates = summary_table.find_all(lambda tag: tag.name == 'td' and re.search(r'DIMM\d', tag.get_text()) and not tag.find('td'))
+                ram_models = [re.sub(r'\s+\(.*\)', '', label.find_next('td').get_text(strip=True)) for label in ram_candidates if label.find_next('td')]
+                data['Модели плашек ОЗУ'] = "; ".join(filter(None, ram_models)) or 'Не найдено'
+                disk_candidates = summary_table.find_all(lambda tag: tag.name == 'td' and 'Дисковый накопитель' in tag.get_text() and not tag.find('td'))
+                disk_models = [label.find_next('td').get_text(strip=True) for label in disk_candidates if label.find_next('td')]
+                data['Дисковые накопители'] = "; ".join(disk_models) or 'Не найдено'
+                printer_candidates = summary_table.find_all(lambda tag: tag.name == 'td' and 'Принтер' in tag.get_text() and not tag.find('td'))
+                all_printers = [label.find_next('td').get_text(strip=True) for label in printer_candidates if label.find_next('td')]
+                system_printers_keys = ['Fax', 'Microsoft Print to PDF', 'XPS', 'OneNote', 'AnyDesk']
+                physical_printers = [p for p in all_printers if not any(key in p for key in system_printers_keys)]
+                data['Принтеры'] = "; ".join(physical_printers) or 'Не найдено'
+
             mobo_section = soup.find('a', {'name': 'motherboard'})
-            mobo_table = mobo_section.find_next('table') if mobo_section else summary_table 
+            mobo_table = mobo_section.find_next('table') if mobo_section else summary_table
+            data['Сокет'] = self.find_value_by_label(mobo_table, 'Разъёмы для ЦП') or ''
+
             bios_section = soup.find('a', {'name': 'bios'})
             bios_table = bios_section.find_next('table') if bios_section else summary_table
+            data['Дата BIOS'] = self.find_value_by_label(bios_table, 'Дата BIOS системы') or ''
 
-            if not summary_table:
-                logger.warning(f"В файле {os.path.basename(file_path)} не найдена основная таблица. Пропуск.")
-                return None
+            data['SMART Статус'], data['SMART Проблемы'] = self.parse_smart_data(soup)
             
-            smart_status, smart_problems = self.parse_smart_data(soup)
-            
-            data_points = {
-                'Кабинет': self.find_value_by_label(summary_table, 'Имя компьютера'),
-                'Имя файла': os.path.basename(file_path),
-                'Локальный IP': self.find_value_by_label(summary_table, 'Первичный адрес IP'),
-                'ОС': self.find_value_by_label(summary_table, 'Операционная система'),
-                'Процессор': self.find_value_by_label(summary_table, 'Тип ЦП'),
-                'Материнская плата': self.find_value_by_label(summary_table, 'Системная плата'),
-                'Видеоадаптер': self.find_value_by_label(summary_table, 'Видеоадаптер'),
-                'Монитор': self.find_value_by_label(summary_table, 'Монитор'),
-                'Объем ОЗУ': self.find_value_by_label(summary_table, 'Системная память'),
-                'Сокет': self.find_value_by_label(mobo_table, 'Разъёмы для ЦП'),
-                'Дата BIOS': self.find_value_by_label(bios_table, 'Дата BIOS системы'),
-                'SMART Статус': smart_status, 'SMART Проблемы': smart_problems,
-            }
-            
-            # --- ФИНАЛЬНЫЙ, УЛЬТРА-НАДЕЖНЫЙ БЛОК АНАЛИЗА ОЗУ ---
-            ram_candidates = summary_table.find_all(
-                lambda tag: tag.name == 'td' and 'DIMM' in tag.get_text() and not tag.find('td')
-            )
-            
-            ram_models = []
-            ram_full_descriptions = []
-            ram_label_texts = [label.get_text(strip=True) for label in ram_candidates]
-
-            for label in ram_candidates:
-                value_td = label.find_next('td')
-                if value_td:
-                    ram_full_descriptions.append(value_td.get_text(strip=True))
-                    ram_models.append(re.sub(r'\s+\(.*\)', '', value_td.get_text(strip=True)))
-
-            installed_sticks_count = len(ram_models)
+            installed_sticks_count = data['Модели плашек ОЗУ'].count(';') + 1 if data.get('Модели плашек ОЗУ') and data['Модели плашек ОЗУ'] != 'Не найдено' else 0
             total_ram_slots = 0
-
             if installed_sticks_count > 0:
-                if installed_sticks_count >= 3:
-                    # Если установлено 3 или 4 плашки, на плате не может быть меньше 4 слотов.
+                html_content_lower = html_content.lower()
+                if installed_sticks_count >= 3: 
                     total_ram_slots = 4
+                elif 'so-dimm' in html_content_lower:
+                    total_ram_slots = 2
                 else: 
-                    # Если плашек 1 или 2, применяем старую логику
-                    is_sodimm = any('SO-DIMM' in desc for desc in ram_full_descriptions)
-                    if is_sodimm:
-                        total_ram_slots = 2
-                    else:
-                        has_high_slots = any('DIMM3' in label or 'DIMM4' in label for label in ram_label_texts)
-                        if has_high_slots:
-                            total_ram_slots = 4
-                        else:
-                            total_ram_slots = 2
+                    has_high_slots = 'dimm3' in html_content_lower or 'dimm4' in html_content_lower
+                    if has_high_slots: total_ram_slots = 4
+                    else: total_ram_slots = 2
+            data['Кол-во плашек ОЗУ'] = installed_sticks_count
+            data['Свободно слотов ОЗУ'] = total_ram_slots - installed_sticks_count if total_ram_slots > 0 else 'Неизвестно'
+
+            all_headers = list(set(HEADERS_MAIN + HEADERS_NETWORK))
+            for key in all_headers:
+                if key not in data and key != '_RAW_DATA':
+                    data[key] = 'Не найдено'
             
-            data_points['Кол-во плашек ОЗУ'] = installed_sticks_count
-            data_points['Свободно слотов ОЗУ'] = total_ram_slots - installed_sticks_count if total_ram_slots > 0 else 'Неизвестно'
-            data_points['Модели плашек ОЗУ'] = "; ".join(ram_models) or "Не найдено"
-
-            # --- Остальной код парсинга ---
-            disk_candidates = summary_table.find_all(
-                lambda tag: tag.name == 'td' and 'Дисковый накопитель' in tag.get_text() and not tag.find('td')
-            )
-            disk_models = [label.find_next('td').get_text(strip=True) for label in disk_candidates if label.find_next('td')]
-
-            printer_candidates = summary_table.find_all(
-                lambda tag: tag.name == 'td' and 'Принтер' in tag.get_text() and not tag.find('td')
-            )
-            all_printers = [label.find_next('td').get_text(strip=True) for label in printer_candidates if label.find_next('td')]
-            
-            system_printers_keys = ['Fax', 'Microsoft Print to PDF', 'XPS', 'OneNote', 'AnyDesk']
-            physical_printers = [p for p in all_printers if not any(key in p for key in system_printers_keys)]
-            data_points['Дисковые накопители'] = "; ".join(disk_models) or "Не найдено"
-            data_points['Принтеры'] = "; ".join(physical_printers) if physical_printers else "Не найдено"
-
-            return data_points
+            return data
         except Exception as e:
             logger.error(f"КРИТИЧЕСКАЯ ОШИБКА ПАРСИНГА в {os.path.basename(file_path)}: {e}", exc_info=True)
             return None
-                
-    def auto_fit_columns(self, worksheet, max_width=70):
-        for column_cells in worksheet.columns:
-            max_length = 0
-            column_letter = get_column_letter(column_cells[0].column)
-            for cell in column_cells:
-                if cell.value:
-                    lines = str(cell.value).split('\n')
-                    for line in lines:
-                        if len(line) > max_length:
-                            max_length = len(line)
-            adjusted_width = (max_length + 2)
-            worksheet.column_dimensions[column_letter].width = min(adjusted_width, max_width)
 
     def write_to_excel(self, data_list, filename):
         if not data_list: return
@@ -273,23 +324,57 @@ class AidaWorker(QObject):
         
         ws_main = wb.active
         ws_main.title = "Все данные"
-        ws_main.append(HEADERS_MAIN)
+        
+        # <<< ИЗМЕНЕНИЕ: Создаем единый список ВСЕХ заголовков для сохранения >>>
+        all_headers_to_save = sorted(list(set(HEADERS_MAIN + HEADERS_NETWORK)))
+        # Перемещаем _RAW_DATA в конец, если он там не оказался
+        if '_RAW_DATA' in all_headers_to_save:
+            all_headers_to_save.remove('_RAW_DATA')
+            all_headers_to_save.append('_RAW_DATA')
+
+        ws_main.append(all_headers_to_save)
+        
         for cell in ws_main[1]: cell.font=header_font; cell.fill=header_fill; cell.alignment=header_alignment; cell.border=thin_border
         
         for row_idx, data_row in enumerate(data_list, start=2):
             smart_problems_str = "; ".join(data_row.get('SMART Проблемы', [])) if data_row.get('SMART Проблемы') else data_row.get('SMART Статус', 'OK')
-            data_row_display = data_row.copy(); data_row_display['SMART Статус'] = smart_problems_str
-            row_values = [data_row_display.get(h, '') for h in HEADERS_MAIN]
+            
+            data_row_display = data_row.copy()
+            data_row_display['SMART Статус'] = smart_problems_str
+            raw_data_string = f"{data_row.get('category', 3)}|{data_row.get('SMART Статус', 'GOOD')}|" + "|".join(data_row.get('SMART Проблемы', []))
+            data_row_display['_RAW_DATA'] = raw_data_string
+            
+            row_values = [data_row_display.get(h, '') for h in all_headers_to_save]
             ws_main.append(row_values)
+            
             row_fill, row_font = {1:(cat1_fill,cat1_font), 2:(cat2_fill,cat2_font), 3:(cat3_fill,data_font)}.get(data_row.get('category'),(None,data_font))
             for cell in ws_main[row_idx]:
-                cell.font=row_font; cell.alignment=data_alignment; cell.border=thin_border
+                cell.font = row_font; cell.alignment = data_alignment; cell.border = thin_border
                 if row_fill: cell.fill = row_fill
-            smart_cell_index = HEADERS_MAIN.index('SMART Статус') + 1; smart_cell = ws_main.cell(row=row_idx, column=smart_cell_index)
-            if data_row.get('SMART Статус') == 'BAD': smart_cell.font = smart_bad_font
+            
+            try: # Защита от отсутствия колонки в старом формате
+                smart_cell_index = all_headers_to_save.index('SMART Статус') + 1
+                smart_cell = ws_main.cell(row=row_idx, column=smart_cell_index)
+                if data_row.get('SMART Статус') == 'BAD': smart_cell.font = smart_bad_font
+            except ValueError:
+                pass
         
+        raw_data_col_letter = get_column_letter(all_headers_to_save.index('_RAW_DATA') + 1)
+        ws_main.column_dimensions[raw_data_col_letter].hidden = True
+
+        for col_idx in range(1, ws_main.max_column):
+            if ws_main.column_dimensions[get_column_letter(col_idx)].hidden: continue
+            column = ws_main.column_dimensions[get_column_letter(col_idx)]
+            max_length = 0
+            for cell in ws_main[get_column_letter(col_idx)]:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except: pass
+            adjusted_width = (max_length + 3)
+            column.width = min(adjusted_width, 60)
+        ws_main.column_dimensions['A'].width = 25
         ws_main.freeze_panes = 'A2'
-        self.auto_fit_columns(ws_main)
         
         ws_analysis = wb.create_sheet("Рекомендации"); cat_font = Font(bold=True, name='Calibri', size=12)
         for cat_num, cat_name, cat_fill in [(1, 'Категория 1: Полная замена', cat1_fill), (2, 'Категория 2: Частичный апгрейд', cat2_fill)]:
@@ -297,28 +382,31 @@ class AidaWorker(QObject):
             for cell in ws_analysis[ws_analysis.max_row]: cell.font=header_font; cell.fill=header_fill; cell.alignment=header_alignment; cell.border=thin_border
             for data in data_list:
                 if data.get('category') == cat_num:
-                    rec = ""; problems_str = data.get('problems', '')
+                    rec = ""
                     if data.get('SMART Статус') == "BAD": rec = "ЗАМЕНА ДИСКА!"
                     elif cat_num == 1: rec = "Полная замена"
                     else:
                         rec_list = []
-                        p_lower = problems_str.lower()
-                        if 'ос' in p_lower or 'windows 7' in p_lower: rec_list.append("Обновить ОС")
-                        if 'ssd' in p_lower: rec_list.append("Установить SSD")
-                        if 'озу' in p_lower: rec_list.append("Добавить ОЗУ")
-                        if 'видеодрайвер' in p_lower: rec_list.append("Установить видеодрайвер")
-                        if 'bios' in p_lower: rec_list.append("Обновить BIOS (опционально)")
+                        problems_str = data.get('problems', '').lower()
+                        if 'ос' in problems_str or 'windows 7' in problems_str: rec_list.append("Обновить ОС")
+                        if 'ssd' in problems_str: rec_list.append("Установить SSD")
+                        if 'озу' in problems_str: rec_list.append("Добавить ОЗУ")
+                        if 'видеодрайвер' in problems_str: rec_list.append("Установить видеодрайвер")
+                        if 'bios' in problems_str: rec_list.append("Обновить BIOS (опционально)")
+                        if 'мало места на диске' in problems_str: rec_list.append("Очистить диск C:")
                         rec = ", ".join(rec_list) if rec_list else "Частичный апгрейд"
-                    ws_analysis.append([data['Имя файла'], data['Кабинет'], problems_str, rec])
+                    ws_analysis.append([data['Имя файла'], data['Название ПК'], data.get('problems', ''), rec])
             ws_analysis.append([])
-        
-        self.auto_fit_columns(ws_analysis)
+        for col_idx in range(1, ws_analysis.max_column + 1):
+            max_length = max((len(str(cell.value)) for cell in ws_analysis[get_column_letter(col_idx)] if cell.value and not isinstance(cell, MergedCell)), default=0)
+            if col_idx in [1, 3, 4]: max_length = max(max_length, 35) 
+            ws_analysis.column_dimensions[get_column_letter(col_idx)].width = min((max_length + 2), 100)
             
         ws_dash = wb.create_sheet("Дашборд"); cat_counts = {'Требуют замены (BAD)':0, 'Нужен апгрейд (OK)':0, 'В порядке (GOOD)':0}; ram_dist = {'< 4 ГБ':0, '4-8 ГБ':0, '8-16 ГБ':0, '> 16 ГБ':0}
         for data in data_list:
-            category = data.get('category')
-            if category: cat_counts[{1:'Требуют замены (BAD)', 2:'Нужен апгрейд (OK)', 3:'В порядке (GOOD)'}[category]] += 1
-            ram_text = data.get('Объем ОЗУ', '0 MB'); ram_gb_match = re.search(r'(\d+)\s*МБ', ram_text)
+            category = data.get('category', 3)
+            cat_counts[{1:'Требуют замены (BAD)', 2:'Нужен апгрейд (OK)', 3:'В порядке (GOOD)'}[category]] += 1
+            ram_text = data.get('Объем ОЗУ', '0 MB'); ram_gb_match = re.search(r'(\d+)\s*МБ', ram_text or '')
             if ram_gb_match:
                 ram_gb = int(ram_gb_match.group(1))/1024
                 if ram_gb < 4: ram_dist['< 4 ГБ']+=1
