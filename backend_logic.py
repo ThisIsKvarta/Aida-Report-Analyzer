@@ -14,7 +14,6 @@ from PySide6.QtCore import QObject, Signal
 
 logger = logging.getLogger(__name__)
 
-# Разделенные заголовки для разных вкладок и служебная колонка
 HEADERS_MAIN = [
     'Название ПК', 'Имя файла', 'ОС', 'Процессор', 'Сокет',
     'Материнская плата', 'Видеоадаптер', 'Монитор', 'Принтеры', 'Объем ОЗУ',
@@ -40,11 +39,10 @@ class ExcelReaderWorker(QObject):
         super().__init__()
         self.filepath = filepath
 
-    def run(self): # <- это внутри ExcelReaderWorker
+    def run(self):
         try:
             self.log_message.emit(f"Загрузка данных из {os.path.basename(self.filepath)}...", "info")
             wb = load_workbook(self.filepath)
-            # ВНИМАНИЕ: get_sheet_by_name устарел, используем wb['название']
             ws = wb["Все данные"]
             
             headers = [cell.value for cell in ws[1]]
@@ -81,6 +79,53 @@ class ExcelReaderWorker(QObject):
             self.log_message.emit(f"Ошибка при чтении Excel: {e}", "error")
             logger.error(f"Ошибка при чтении Excel: {e}", exc_info=True)
             self.finished.emit("")
+
+class ExcelUpdateWorker(QObject):
+    log_message = Signal(str, str)
+    finished = Signal()
+
+    def __init__(self, filepath, unique_id, header_to_update, new_value):
+        super().__init__()
+        self.filepath = filepath
+        self.unique_id = unique_id
+        self.header = header_to_update
+        self.new_value = new_value
+
+    def run(self):
+        try:
+            if not os.path.exists(self.filepath):
+                self.log_message.emit(f"Ошибка: Файл {self.filepath} не найден для обновления.", "error")
+                self.finished.emit(); return
+
+            wb = load_workbook(self.filepath)
+            ws = wb["Все данные"]
+            
+            headers = [cell.value for cell in ws[1]]
+            try:
+                update_col_idx = headers.index(self.header) + 1
+                id_col_idx = headers.index("Имя файла") + 1
+            except ValueError as e:
+                self.log_message.emit(f"Критическая ошибка: не найдена колонка '{e}' в Excel.", "error")
+                self.finished.emit(); return
+            
+            target_row_idx = -1
+            for row in range(2, ws.max_row + 1):
+                if ws.cell(row=row, column=id_col_idx).value == self.unique_id:
+                    target_row_idx = row
+                    break
+            
+            if target_row_idx != -1:
+                ws.cell(row=target_row_idx, column=update_col_idx).value = self.new_value
+                wb.save(self.filepath)
+                self.log_message.emit(f"Ячейка для '{self.unique_id}' обновлена.", "info")
+            else:
+                self.log_message.emit(f"Не удалось найти строку для '{self.unique_id}' в Excel.", "warning")
+
+        except Exception as e:
+            self.log_message.emit(f"Ошибка при обновлении Excel: {e}", "error")
+            logger.error(f"Ошибка обновления Excel: {e}", exc_info=True)
+        finally:
+            self.finished.emit()
 
 
 class AidaWorker(QObject):
@@ -133,23 +178,16 @@ class AidaWorker(QObject):
             self.finished.emit("")
 
     def find_value_by_label(self, search_area, label_text):
-        if not search_area:
-            return None
+        if not search_area: return None
         try:
-            candidates = search_area.find_all(
-                lambda tag: tag.name == 'td' and label_text in tag.get_text() and not tag.find('td')
-            )
-            if not candidates:
-                return None
+            candidates = search_area.find_all(lambda tag: tag.name == 'td' and label_text in tag.get_text() and not tag.find('td'))
+            if not candidates: return None
             label_td = candidates[-1]
             value_td = label_td.find_next_sibling('td')
-            if not value_td:
-                value_td = label_td.find_next('td')
+            if not value_td: value_td = label_td.find_next('td')
             if value_td:
                 link = value_td.find('a')
-                if link:
-                    return link.get_text(strip=True)
-                return value_td.get_text(strip=True)
+                return link.get_text(strip=True) if link else value_td.get_text(strip=True)
             return None
         except Exception as e:
             logger.error(f"Ошибка в find_value_by_label для '{label_text}': {e}", exc_info=True)
@@ -184,76 +222,52 @@ class AidaWorker(QObject):
     def analyze_system(self, data):
         problems = []
         smart_status = data.get('SMART Статус', "Не найден")
-        if smart_status == "BAD":
-            return 1, "; ".join(data.get('SMART Проблемы', ["Критическая ошибка диска"]))
-        if smart_status == "OK":
-            problems.extend(data.get('SMART Проблемы', []))
+        if smart_status == "BAD": return 1, "; ".join(data.get('SMART Проблемы', ["Критическая ошибка диска"]))
+        if smart_status == "OK": problems.extend(data.get('SMART Проблемы', []))
         
-        bios_age_limit = self.config.getint('Analysis', 'bios_age_limit_years', fallback=5)
-        ram_critical_gb = self.config.getfloat('Analysis', 'ram_critical_gb', fallback=3.8)
-        ram_upgrade_gb = self.config.getfloat('Analysis', 'ram_upgrade_gb', fallback=7.8)
-        disk_c_critical_gb = self.config.getfloat('Analysis', 'disk_c_critical_gb', fallback=15.0)
+        bios_age_limit = self.config.getint('Analysis', 'bios_age_limit_years', fallback=5); ram_critical_gb = self.config.getfloat('Analysis', 'ram_critical_gb', fallback=3.8); ram_upgrade_gb = self.config.getfloat('Analysis', 'ram_upgrade_gb', fallback=7.8); disk_c_critical_gb = self.config.getfloat('Analysis', 'disk_c_critical_gb', fallback=15.0)
 
         os_ver, cpu, socket = data.get('ОС'), data.get('Процессор'), data.get('Сокет')
-        ram_gb_str = re.search(r'(\d+)\s*МБ', data.get('Объем ОЗУ') or '')
-        ram_gb = int(ram_gb_str.group(1)) / 1024 if ram_gb_str else 0
-        gpu_driver = data.get('Видеоадаптер')
-        bios_date_str = data.get('Дата BIOS')
+        ram_gb_str = re.search(r'(\d+)\s*МБ', data.get('Объем ОЗУ') or ''); ram_gb = int(ram_gb_str.group(1)) / 1024 if ram_gb_str else 0
+        gpu_driver = data.get('Видеоадаптер'); bios_date_str = data.get('Дата BIOS')
         has_ssd = any(k in (data.get('Дисковые накопители') or '').lower() for k in ['ssd', 'nvme', 'snv'])
         disk_c_free_gb = data.get('Disk_C_Free_GB', -1)
 
         is_critical = False
-        if socket and 'LGA775' in socket:
-            is_critical=True; problems.append("Очень старый сокет (LGA775)")
-        if ram_gb > 0 and ram_gb < ram_critical_gb:
-            is_critical=True; problems.append(f"Критически мало ОЗУ ({ram_gb:.1f} ГБ)")
-        if os_ver and 'Windows 7' in os_ver and cpu and any(p in cpu for p in ['G3','G1','E5','i3-2','i3-3','FX']):
-            is_critical=True; problems.append("Устаревшая ОС на очень слабом ЦП")
+        if socket and 'LGA775' in socket: is_critical=True; problems.append("Очень старый сокет (LGA775)")
+        if ram_gb > 0 and ram_gb < ram_critical_gb: is_critical=True; problems.append(f"Критически мало ОЗУ ({ram_gb:.1f} ГБ)")
+        if os_ver and 'Windows 7' in os_ver and cpu and any(p in cpu for p in ['G3','G1','E5','i3-2','i3-3','FX']): is_critical=True; problems.append("Устаревшая ОС на очень слабом ЦП")
         
-        if is_critical:
-            return 1, "; ".join(problems)
+        if is_critical: return 1, "; ".join(problems)
 
         is_upgrade_needed = len(problems) > 0
-        if os_ver and 'Windows 7' in os_ver:
-            is_upgrade_needed=True; problems.append("Устаревшая ОС Windows 7")
-        if ram_critical_gb <= ram_gb < ram_upgrade_gb:
-            is_upgrade_needed=True; problems.append(f"Недостаточно ОЗУ ({ram_gb:.1f} ГБ)")
-        if not has_ssd:
-            is_upgrade_needed=True; problems.append("Отсутствует SSD")
-        if gpu_driver and 'Microsoft Basic Display Adapter' in gpu_driver:
-            is_upgrade_needed=True; problems.append("Не установлен видеодрайвер")
-        if disk_c_free_gb != -1 and disk_c_free_gb < disk_c_critical_gb:
-            is_upgrade_needed=True; problems.append(f"Мало места на диске C: ({disk_c_free_gb:.1f} ГБ)")
-
+        if os_ver and 'Windows 7' in os_ver: is_upgrade_needed=True; problems.append("Устаревшая ОС Windows 7")
+        if ram_critical_gb <= ram_gb < ram_upgrade_gb: is_upgrade_needed=True; problems.append(f"Недостаточно ОЗУ ({ram_gb:.1f} ГБ)")
+        if not has_ssd: is_upgrade_needed=True; problems.append("Отсутствует SSD")
+        if gpu_driver and 'Microsoft Basic Display Adapter' in gpu_driver: is_upgrade_needed=True; problems.append("Не установлен видеодрайвер")
+        if disk_c_free_gb != -1 and disk_c_free_gb < disk_c_critical_gb: is_upgrade_needed=True; problems.append(f"Мало места на диске C: ({disk_c_free_gb:.1f} ГБ)")
         if bios_date_str:
             try:
                 date_match = re.search(r'(\d{2}/\d{2}/\d{2,4})', bios_date_str)
                 if date_match:
                     date_str_extracted = date_match.group(1)
                     bios_date_format = '%m/%d/%Y' if int(date_match.group(1).split('/')[0]) <= 12 and int(date_match.group(1).split('/')[1]) <= 31 else '%d/%m/%Y'
-                    if len(date_str_extracted.split('/')[-1]) == 2:
-                        bios_date_format = bios_date_format.replace('Y', 'y')
+                    if len(date_str_extracted.split('/')[-1]) == 2: bios_date_format = bios_date_format.replace('Y', 'y')
                     bios_date = datetime.strptime(date_str_extracted, bios_date_format)
-                    if (datetime.now() - bios_date).days > 365 * bios_age_limit:
-                        is_upgrade_needed=True; problems.append(f"BIOS старше {bios_age_limit} лет")
+                    if (datetime.now() - bios_date).days > 365 * bios_age_limit: is_upgrade_needed=True; problems.append(f"BIOS старше {bios_age_limit} лет")
             except (ValueError, IndexError): pass
-
-        if is_upgrade_needed:
-            return 2, "; ".join(problems)
-
+        
+        if is_upgrade_needed: return 2, "; ".join(problems)
         return 3, "Состояние хорошее"
     
     def parse_aida_report(self, file_path):
         self.log_message.emit(f"Обработка: {os.path.basename(file_path)}", "info")
         try:
-            with open(file_path, 'r', encoding='windows-1251', errors='ignore') as f:
-                html_content = f.read()
+            with open(file_path, 'r', encoding='windows-1251', errors='ignore') as f: html_content = f.read()
             soup = BeautifulSoup(html_content, 'lxml')
             data = {'Имя файла': os.path.basename(file_path)}
-
-            summary_section = soup.find('a', {'name': 'summary'})
-            summary_table = summary_section.find_next('table') if summary_section else None
-
+            summary_section = soup.find('a', {'name': 'summary'}); summary_table = summary_section.find_next('table') if summary_section else None
+            
             if summary_table:
                 data['Название ПК'] = self.find_value_by_label(summary_table, 'Имя компьютера') or ''
                 data['ОС'] = self.find_value_by_label(summary_table, 'Операционная система') or ''
@@ -264,12 +278,10 @@ class AidaWorker(QObject):
                 data['Объем ОЗУ'] = self.find_value_by_label(summary_table, 'Системная память') or ''
                 data['Локальный IP'] = self.find_value_by_label(summary_table, 'Первичный адрес IP') or ''
                 data['MAC-адрес'] = self.find_value_by_label(summary_table, 'Первичный адрес MAC') or ''
-                disk_c_text = self.find_value_by_label(summary_table, 'C: (NTFS)')
+                disk_c_text = self.find_value_by_label(summary_table, 'C: (NTFS)');
                 if disk_c_text:
                     match = re.search(r'\((\d+)\s*МБ\s*свободно\)', disk_c_text)
-                    if match:
-                        free_mb = int(match.group(1))
-                        data['Disk_C_Free_GB'] = round(free_mb / 1024, 1)
+                    if match: data['Disk_C_Free_GB'] = round(int(match.group(1)) / 1024, 1)
                 ram_candidates = summary_table.find_all(lambda tag: tag.name == 'td' and re.search(r'DIMM\d', tag.get_text()) and not tag.find('td'))
                 ram_models = [re.sub(r'\s+\(.*\)', '', label.find_next('td').get_text(strip=True)) for label in ram_candidates if label.find_next('td')]
                 data['Модели плашек ОЗУ'] = "; ".join(filter(None, ram_models)) or 'Не найдено'
@@ -282,24 +294,18 @@ class AidaWorker(QObject):
                 physical_printers = [p for p in all_printers if not any(key in p for key in system_printers_keys)]
                 data['Принтеры'] = "; ".join(physical_printers) or 'Не найдено'
 
-            mobo_section = soup.find('a', {'name': 'motherboard'})
-            mobo_table = mobo_section.find_next('table') if mobo_section else summary_table
+            mobo_section = soup.find('a', {'name': 'motherboard'}); mobo_table = mobo_section.find_next('table') if mobo_section else summary_table
             data['Сокет'] = self.find_value_by_label(mobo_table, 'Разъёмы для ЦП') or ''
-
-            bios_section = soup.find('a', {'name': 'bios'})
-            bios_table = bios_section.find_next('table') if bios_section else summary_table
+            bios_section = soup.find('a', {'name': 'bios'}); bios_table = bios_section.find_next('table') if bios_section else summary_table
             data['Дата BIOS'] = self.find_value_by_label(bios_table, 'Дата BIOS системы') or ''
-
             data['SMART Статус'], data['SMART Проблемы'] = self.parse_smart_data(soup)
             
             installed_sticks_count = data['Модели плашек ОЗУ'].count(';') + 1 if data.get('Модели плашек ОЗУ') and data['Модели плашек ОЗУ'] != 'Не найдено' else 0
             total_ram_slots = 0
             if installed_sticks_count > 0:
                 html_content_lower = html_content.lower()
-                if installed_sticks_count >= 3: 
-                    total_ram_slots = 4
-                elif 'so-dimm' in html_content_lower:
-                    total_ram_slots = 2
+                if installed_sticks_count >= 3: total_ram_slots = 4
+                elif 'so-dimm' in html_content_lower: total_ram_slots = 2
                 else: 
                     has_high_slots = 'dimm3' in html_content_lower or 'dimm4' in html_content_lower
                     if has_high_slots: total_ram_slots = 4
@@ -309,9 +315,7 @@ class AidaWorker(QObject):
 
             all_headers = list(set(HEADERS_MAIN + HEADERS_NETWORK))
             for key in all_headers:
-                if key not in data and key != '_RAW_DATA':
-                    data[key] = 'Не найдено'
-            
+                if key not in data and key != '_RAW_DATA': data[key] = 'Не найдено'
             return data
         except Exception as e:
             logger.error(f"КРИТИЧЕСКАЯ ОШИБКА ПАРСИНГА в {os.path.basename(file_path)}: {e}", exc_info=True)
@@ -322,16 +326,8 @@ class AidaWorker(QObject):
         wb = Workbook()
         header_font=Font(bold=True,color="FFFFFF",name='Calibri',size=11); header_fill=PatternFill(start_color="4F81BD",end_color="4F81BD",fill_type="solid"); header_alignment=Alignment(horizontal='center',vertical='center',wrap_text=True); thin_border=Border(left=Side(style='thin'),right=Side(style='thin'),top=Side(style='thin'),bottom=Side(style='thin')); data_font=Font(name='Calibri',size=11); data_alignment=Alignment(vertical='center',wrap_text=True,horizontal='left'); cat1_fill=PatternFill(start_color="FFC7CE",end_color="FFC7CE",fill_type="solid"); cat1_font=Font(color="9C0006",name='Calibri',size=11); cat2_fill=PatternFill(start_color="FFEB9C",end_color="FFEB9C",fill_type="solid"); cat2_font=Font(color="9C6500",name='Calibri',size=11); cat3_fill=PatternFill(start_color="C6EFCE",end_color="C6EFCE",fill_type="solid"); smart_bad_font=Font(bold=True,color="9C0006")
         
-        ws_main = wb.active
-        ws_main.title = "Все данные"
-        
-        # <<< ИЗМЕНЕНИЕ: Создаем единый список ВСЕХ заголовков для сохранения >>>
-        all_headers_to_save = sorted(list(set(HEADERS_MAIN + HEADERS_NETWORK)))
-        # Перемещаем _RAW_DATA в конец, если он там не оказался
-        if '_RAW_DATA' in all_headers_to_save:
-            all_headers_to_save.remove('_RAW_DATA')
-            all_headers_to_save.append('_RAW_DATA')
-
+        ws_main = wb.active; ws_main.title = "Все данные"
+        all_headers_to_save = sorted(list(set(HEADERS_MAIN + HEADERS_NETWORK))); all_headers_to_save.remove('_RAW_DATA'); all_headers_to_save.append('_RAW_DATA')
         ws_main.append(all_headers_to_save)
         
         for cell in ws_main[1]: cell.font=header_font; cell.fill=header_fill; cell.alignment=header_alignment; cell.border=thin_border
@@ -352,25 +348,20 @@ class AidaWorker(QObject):
                 cell.font = row_font; cell.alignment = data_alignment; cell.border = thin_border
                 if row_fill: cell.fill = row_fill
             
-            try: # Защита от отсутствия колонки в старом формате
+            try:
                 smart_cell_index = all_headers_to_save.index('SMART Статус') + 1
                 smart_cell = ws_main.cell(row=row_idx, column=smart_cell_index)
                 if data_row.get('SMART Статус') == 'BAD': smart_cell.font = smart_bad_font
-            except ValueError:
-                pass
+            except ValueError: pass
         
         raw_data_col_letter = get_column_letter(all_headers_to_save.index('_RAW_DATA') + 1)
         ws_main.column_dimensions[raw_data_col_letter].hidden = True
 
         for col_idx in range(1, ws_main.max_column):
             if ws_main.column_dimensions[get_column_letter(col_idx)].hidden: continue
-            column = ws_main.column_dimensions[get_column_letter(col_idx)]
-            max_length = 0
-            for cell in ws_main[get_column_letter(col_idx)]:
-                try:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(str(cell.value))
-                except: pass
+            column_letter = get_column_letter(col_idx)
+            column = ws_main.column_dimensions[column_letter]
+            max_length = max((len(str(cell.value)) for cell in ws_main[column_letter] if cell.value), default=0)
             adjusted_width = (max_length + 3)
             column.width = min(adjusted_width, 60)
         ws_main.column_dimensions['A'].width = 25
