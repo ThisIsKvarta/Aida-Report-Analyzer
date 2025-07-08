@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.spec
 
 # IDE & Editor specific
 .vscode/
@@ -11,6 +12,7 @@ __pycache__/
 # Local files
 system_analysis.db
 parser.log
+config.ini
 
 # Report & output files
 /reports/
@@ -21,3 +23,7 @@ venv/
 .venv/
 env/
 .env
+
+# Build artifacts
+/build/
+/dist/
