@@ -1,22 +1,23 @@
-# Исключения для Python
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.spec
+
+# IDE & Editor specific
+.vscode/
+.idea/
+
+# Local files
+system_analysis.db
+parser.log
+
+# Report & output files
+/reports/
+*.xlsx
+
+# Virtual environment
 venv/
 .venv/
-
-# Исключения для PyInstaller
-build/
-dist/
-
-# Исключения для нашего проекта
-*.xlsx
-*.log
-debug_output.txt
-reports/
-
-# Системные файлы Windows/macOS
-.DS_Store
-Thumbs.db
+env/
+.env
