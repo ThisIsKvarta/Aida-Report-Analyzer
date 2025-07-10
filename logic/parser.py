@@ -9,6 +9,9 @@ from utils.constants import CRITICAL_SMART_ATTRIBUTES, HEADERS_MAIN, HEADERS_NET
 logger = logging.getLogger(__name__)
 
 def find_value_by_label(search_area, label_text):
+    """
+    Находит значение в таблице по тексту метки в соседней ячейке.
+    """
     if not search_area: return None
     try:
         candidates = search_area.find_all(lambda tag: tag.name == 'td' and label_text in tag.get_text(strip=True) and not tag.find('td'))
@@ -25,6 +28,9 @@ def find_value_by_label(search_area, label_text):
         return None
 
 def parse_aida_report(file_path, config, log_emitter):
+    """
+    Основная функция парсинга HTML-отчета AIDA64.
+    """
     log_emitter(f"Обработка: {os.path.basename(file_path)}", "info")
     try:
         with open(file_path, 'r', encoding='windows-1251', errors='ignore') as f:
@@ -33,12 +39,12 @@ def parse_aida_report(file_path, config, log_emitter):
         soup = BeautifulSoup(html_content, 'lxml')
         data = {'Имя файла': os.path.basename(file_path)}
         
-        # 1. Парсинг основной сводки
+        # --- 1. ПАРСИНГ ОСНОВНОЙ СВОДКИ ---
         summary_section = soup.find('a', attrs={'name': 'summary'})
         summary_table = summary_section.find_next('table') if summary_section else None
         
         if not summary_table:
-            logger.error(f"[{data['Имя файла']}] Не найдена основная сводная таблица.")
+            logger.error(f"[{data['Имя файла']}] Не найдена основная сводная таблица. Парсинг невозможен.")
             return None
 
         data['Название ПК'] = find_value_by_label(summary_table, 'Имя компьютера') or ''
@@ -57,73 +63,105 @@ def parse_aida_report(file_path, config, log_emitter):
         system_printers_keys = ['Fax', 'Microsoft Print to PDF', 'XPS', 'OneNote', 'AnyDesk']
         data['Принтеры'] = "; ".join([p for p in all_printers if not any(key in p for key in system_printers_keys)]) or 'Не найдено'
 
-        # 2. УНИВЕРСАЛЬНЫЙ ПАРСИНГ ОЗУ
-        ram_models = []
-        # Способ А: Ищем плашки прямо в сводной таблице
-        ram_labels_in_summary = summary_table.find_all('td', text=re.compile(r'^\s*DIMM\d:'))
-        if ram_labels_in_summary:
-            logger.info(f"[{data['Имя файла']}] Найдены модули ОЗУ в сводной таблице.")
-            for label in ram_labels_in_summary:
-                model_text = label.find_next_sibling('td').get_text(strip=True)
-                # Просто берем текст как есть
-                ram_models.append(model_text)
-        
-        # Способ Б: Если в сводке пусто, ищем детальные секции
-        if not ram_models:
-            logger.warning(f"[{data['Имя файла']}] ОЗУ в сводке не найдено. Ищу в детальных секциях...")
-            ram_headers = soup.find_all('td', class_='dt', text=re.compile(r'\[\s*(Устройства памяти|SPD)\s*/'))
-            logger.info(f"[{data['Имя файла']}] Найдено {len(ram_headers)} детальных заголовков ОЗУ.")
-            
-            for header in ram_headers:
-                info_table = header.find_next('table')
-                if not info_table: continue
-                
-                # Просто берем размер, это самое надежное
-                module_size = find_value_by_label(info_table, 'Размер')
-                if module_size and module_size.strip():
-                    ram_models.append(f"Модуль {module_size.strip()}")
-
-        data['Модели плашек ОЗУ'] = "; ".join(ram_models) or 'Не найдено'
-        data['Кол-во плашек ОЗУ'] = len(ram_models)
-
-        # 3. Парсинг остальной информации
+        # --- 2. УЛУЧШЕННЫЙ УНИВЕРСАЛЬНЫЙ ПАРСИНГ ОЗУ ---
         mobo_section = soup.find('a', attrs={'name': 'motherboard'}); mobo_table = mobo_section.find_next('table') if mobo_section else None
         data['Сокет'] = find_value_by_label(mobo_table, 'Разъёмы для ЦП') or ''
         
+        # --- ОПРЕДЕЛЕНИЕ ТИПА ПАМЯТИ ---
+        ram_type_to_use = ''
+        supported_mem = find_value_by_label(mobo_table, 'Поддерживаемые типы памяти')
+        if supported_mem:
+            match = re.search(r'(DDR\d+)', supported_mem, re.I)
+            if match: ram_type_to_use = match.group(1).upper()
+        if not ram_type_to_use and data['Сокет']:
+            socket_map = {'AM2': 'DDR2', 'LGA775': 'DDR2', 'AM3': 'DDR3', 'AM4': 'DDR4', 'AM5': 'DDR5', 'LGA1200': 'DDR4', 'LGA1700': 'DDR5'}
+            for s, r_type in socket_map.items():
+                if s in data['Сокет']:
+                    ram_type_to_use = r_type; break
+        
+        # --- ОПРЕДЕЛЕНИЕ ОБЩЕГО КОЛ-ВА СЛОТОВ (НОВАЯ ИЕРАРХИЯ) ---
+        total_ram_slots = 0
+        # Приоритет 1: Ищем точное кол-во в названии системной платы
+        mobo_string = data.get('Материнская плата', '')
+        if mobo_string:
+            match = re.search(r'(\d+)\s+DDR\d\s+DIMM', mobo_string, re.I)
+            if match:
+                total_ram_slots = int(match.group(1))
+                logger.info(f"[{data['Имя файла']}] Общее кол-во слотов ({total_ram_slots}) найдено в строке мат. платы (Приоритет 1).")
+
+        ram_models = []
+        is_summary_parsed = False
+
+        # Способ А: Ищем плашки в сводке
+        ram_labels_in_summary = summary_table.find_all('td', text=re.compile(r'^\s*DIMM\d:'))
+        if ram_labels_in_summary:
+            is_summary_parsed = True
+            for label in ram_labels_in_summary:
+                model_text = label.find_next_sibling('td').get_text(strip=True)
+                if model_text and 'empty' not in model_text.lower() and 'пусто' not in model_text.lower():
+                    cleaned_model = model_text.split('(')[0].strip()
+                    ram_models.append(cleaned_model)
+        
+        # Способ Б: Если в сводке пусто, ищем в деталях
+        if not is_summary_parsed:
+            ram_headers = soup.find_all('td', class_='dt', text=re.compile(r'\[\s*(Устройства памяти|SPD)\s*/'))
+            if ram_headers:
+                # Приоритет 2: Если не было инфо в названии, берем кол-во секций
+                if total_ram_slots == 0:
+                    total_ram_slots = len(ram_headers)
+                    logger.info(f"[{data['Имя файла']}] Общее кол-во слотов ({total_ram_slots}) определено по кол-ву детальных секций (Приоритет 2).")
+                
+                for header in ram_headers:
+                    module_rows_html, current_tr = [], header.find_parent('tr')
+                    if not current_tr: continue
+                    for sibling_tr in current_tr.find_next_siblings('tr'):
+                        if sibling_tr.find('td', class_='dt'): break
+                        module_rows_html.append(str(sibling_tr))
+                    
+                    module_soup = BeautifulSoup(f"<table>{''.join(module_rows_html)}</table>", 'lxml')
+                    module_size = find_value_by_label(module_soup, 'Размер')
+                    if module_size and module_size.strip():
+                        display_text = f"Модуль {module_size.strip()}"
+                        if ram_type_to_use: display_text += f" {ram_type_to_use}"
+                        ram_models.append(display_text)
+
+        data['Модели плашек ОЗУ'] = "; ".join(ram_models) if ram_models else 'Не найдено'
+        data['Кол-во плашек ОЗУ'] = len(ram_models)
+
+        # --- 3. ПАРСИНГ ОСТАЛЬНОЙ ИНФОРМАЦИИ ---
         bios_section = soup.find('a', attrs={'name': 'bios'}); bios_table = bios_section.find_next('table') if bios_section else None
         data['Дата BIOS'] = find_value_by_label(bios_table, 'Дата BIOS системы') or ''
-        
         smart_section = soup.find('a', attrs={'name': 'smart'})
         if smart_section:
             data['SMART Статус'], data['SMART Проблемы'] = parse_smart_data_full(smart_section, config)
         else:
-            status_in_summary = find_value_by_label(summary_table, 'SMART-статус жёстких дисков')
-            data['SMART Статус'] = status_in_summary or "Не найден"
+            data['SMART Статус'] = find_value_by_label(summary_table, 'SMART-статус жёстких дисков') or "Не найден"
             data['SMART Проблемы'] = []
 
-        # 4. Расчет свободных слотов ОЗУ
-        total_ram_slots = 0
-        if data['Кол-во плашек ОЗУ'] > 0:
-            html_content_lower = html_content.lower()
-            if data['Кол-во плашек ОЗУ'] >= 3:
-                total_ram_slots = 4
-            elif 'so-dimm' in html_content_lower:
-                total_ram_slots = 2
-            else:
-                total_ram_slots = 2
-        data['Свободно слотов ОЗУ'] = max(0, total_ram_slots - data['Кол-во плашек ОЗУ']) if total_ram_slots > 0 else 'Неизвестно'
-
-        # 5. Заполняем пропущенные поля
+        # --- 4. РАСЧЕТ СЛОТОВ (ФИНАЛИЗАЦИЯ) ---
+        # Приоритет 3 (эвристика): Если до сих пор не определено, применяем угадывание
+        if total_ram_slots == 0:
+            logger.warning(f"[{data['Имя файла']}] Применяю эвристику для определения кол-ва слотов (Приоритет 3).")
+            mobo_name_lower = data.get('Материнская плата', '').lower()
+            if any(s in mobo_name_lower for s in ['itx', 'thin', 'mini', 'nitro']) or 'so-dimm' in str(ram_models).lower(): total_ram_slots = 2
+            else: total_ram_slots = 4 # По умолчанию для десктопа
+        
+        data['Свободно слотов ОЗУ'] = max(0, total_ram_slots - data['Кол-во плашек ОЗУ'])
+        
+        # --- 5. ЗАПОЛНЕНИЕ ПРОПУСКОВ ---
         all_headers = list(set(HEADERS_MAIN + HEADERS_NETWORK))
         for key in all_headers:
             if key not in data and key != '_RAW_DATA': data[key] = 'Не найдено'
             
         return data
     except Exception as e:
-        logger.error(f"КРИТИЧЕСКАЯ ОШИБКА ПАРСИНГА в {os.path.basename(file_path)}: {e}", exc_info=True)
+        logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА ПАРСИНГА в {os.path.basename(file_path)}: {e}", exc_info=True)
         return None
-    
+
 def parse_smart_data_full(smart_section, config):
+    """
+    Парсит детальную информацию из секции SMART. (без изменений)
+    """
     all_problems = []; has_bad_status=False; has_ok_status=False
     temp_warn = config.getint('SMART', 'temp_warning_celsius', fallback=45)
     power_on_warn = config.getint('SMART', 'power_on_warning_hours', fallback=30000)
@@ -136,9 +174,8 @@ def parse_smart_data_full(smart_section, config):
         current_element = current_element.find_next()
         if not current_element: break
         if current_element.name == 'a' and current_element.has_attr('name'): break
-        if current_element.name == 'table':
-            if current_element.find('td', class_='dt'):
-                drive_tables.append(current_element)
+        if current_element.name == 'table' and current_element.find('td', class_='dt'):
+            drive_tables.append(current_element)
 
     for table in drive_tables:
         header = table.find('td', class_='dt')
@@ -148,7 +185,7 @@ def parse_smart_data_full(smart_section, config):
         for row in table.find_all('tr'):
             cells = row.find_all('td')
             if len(cells) > 3:
-                attr_id = cells[2].get_text(strip=True); attr_desc = cells[3].get_text(strip=True); raw_data_str = cells[-2].get_text(strip=True)
+                attr_id, attr_desc, raw_data_str = cells[2].get_text(strip=True), cells[3].get_text(strip=True), cells[-2].get_text(strip=True)
                 try:
                     raw_data_val = int(raw_data_str, 16) if 'x' in raw_data_str else int(raw_data_str)
                     if attr_id in CRITICAL_SMART_ATTRIBUTES and raw_data_val > 0: has_bad_status = True; all_problems.append(f"{drive_name}: {attr_desc} ({attr_id}) > 0")
@@ -162,14 +199,15 @@ def parse_smart_data_full(smart_section, config):
     return "GOOD", []
     
 def analyze_system(data, config):
+    """
+    Анализирует собранные данные и выставляет категорию проблемы. (без изменений)
+    """
     data['internal_smart_status'] = data['SMART Статус']
-    if data['SMART Статус'] in ['Неизвестно', 'Не найден']:
-        data['internal_smart_status'] = 'GOOD'
+    if data['SMART Статус'] in ['Неизвестно', 'Не найден']: data['internal_smart_status'] = 'GOOD'
     
     problems = []
-    smart_status = data['internal_smart_status']
-    if smart_status == "BAD": return 1, "; ".join(data.get('SMART Проблемы', ["Критическая ошибка диска"]))
-    if smart_status == "OK": problems.extend(data.get('SMART Проблемы', []))
+    if data['internal_smart_status'] == "BAD": return 1, "; ".join(data.get('SMART Проблемы', ["Критическая ошибка диска"]))
+    if data['internal_smart_status'] == "OK": problems.extend(data.get('SMART Проблемы', []))
     
     bios_age_limit = config.getint('Analysis', 'bios_age_limit_years', fallback=5)
     ram_critical_gb = config.getfloat('Analysis', 'ram_critical_gb', fallback=3.8)
@@ -183,8 +221,7 @@ def analyze_system(data, config):
     bios_date_str = data.get('Дата BIOS')
     has_ssd = any(k in (data.get('Дисковые накопители') or '').lower() for k in ['ssd', 'nvme', 'snv'])
     
-    is_critical = False
-    is_upgrade_needed = len(problems) > 0
+    is_critical, is_upgrade_needed = False, len(problems) > 0
     
     if socket and 'LGA775' in socket: is_critical = True; problems.append("Очень старый сокет (LGA775)")
     if ram_gb > 0 and ram_gb < ram_critical_gb: is_critical = True; problems.append(f"Критически мало ОЗУ ({ram_gb:.1f} ГБ)")
@@ -203,11 +240,11 @@ def analyze_system(data, config):
                 parts = re.split(r'[/.-]', date_str_extracted)
                 if len(parts) == 3:
                     p1, p2, p3 = map(int, parts)
-                    if p1 > 12: day, month, year = p1, p2, p3
-                    else: month, day, year = p1, p2, p3
-                    if len(str(year)) == 2: year += 2000
+                    year = p3 if p3 > 1900 else p3 + 2000
+                    day, month = (p1, p2) if p1 <= 12 else (p2, p1)
                     bios_date = datetime(year, month, day)
-                    if (datetime.now() - bios_date).days > 365 * bios_age_limit: is_upgrade_needed = True; problems.append(f"BIOS старше {bios_age_limit} лет")
+                    if (datetime.now() - bios_date).days > 365 * bios_age_limit:
+                        is_upgrade_needed = True; problems.append(f"BIOS старше {bios_age_limit} лет")
         except (ValueError, IndexError): pass
         
     unique_problems = sorted(list(set(problems)))
