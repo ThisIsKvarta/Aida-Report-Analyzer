@@ -1,4 +1,3 @@
-# logic/workers.py
 import os
 import logging
 import platform
@@ -10,14 +9,15 @@ from threading import Thread
 import psutil
 from PySide6.QtCore import QObject, Signal
 
-from logic.parser import analyze_system, parse_aida_report
+# --- НОВЫЕ ИМПОРТЫ ---
+from logic.parser import parse_aida_report
+from logic.analyzer import analyze_system # Импортируем анализатор
 from logic.excel_handler import write_to_excel
 from logic.database_handler import save_data_to_db, fetch_all_data_from_db, update_single_field_in_db
 from utils.helpers import natural_sort_key
 
 logger = logging.getLogger(__name__)
 
-# --- КЛАССЫ AidaWorker, DatabaseUpdateWorker, FullExcelExportWorker ОСТАЮТСЯ БЕЗ ИЗМЕНЕНИЙ ---
 class AidaWorker(QObject):
     log_message = Signal(str, str); progress_update = Signal(int, int); status_update = Signal(str, bool); result_ready = Signal(dict); finished = Signal(str) 
     def __init__(self, reports_dir, config): super().__init__(); self.reports_dir = reports_dir; self.config = config; self.is_running = True
@@ -26,22 +26,36 @@ class AidaWorker(QObject):
             output_file = self.config.get('Settings', 'output_filename', fallback='system_analysis.xlsx'); report_files = [f for f in os.listdir(self.reports_dir) if f.lower().endswith(('.htm', '.html'))]
             if not report_files: self.log_message.emit("В указанной папке не найдено файлов отчетов .htm/.html.", "warning"); self.finished.emit(""); return
             self.log_message.emit(f"Найдено отчетов: {len(report_files)}", "info"); all_reports_data = []; total_files = len(report_files)
+            
             for i, filename in enumerate(report_files):
                 if not self.is_running: break
-                self.progress_update.emit(i + 1, total_files); file_path = os.path.join(self.reports_dir, filename)
-                parsed_data = parse_aida_report(file_path, self.config, self.log_message.emit)
-                if parsed_data:
-                    parsed_data['internal_smart_status'] = parsed_data['SMART Статус']; category, problems_text = analyze_system(parsed_data, self.config)
-                    parsed_data['category'] = category; parsed_data['problems'] = problems_text
-                    if parsed_data.get('SMART Проблемы'): parsed_data['SMART Статус'] = "; ".join(parsed_data['SMART Проблемы'])
-                    self.result_ready.emit(parsed_data); all_reports_data.append(parsed_data)
+                self.progress_update.emit(i + 1, total_files)
+                file_path = os.path.join(self.reports_dir, filename)
+                
+                # --- ИЗМЕНЕННАЯ ЛОГИКА ---
+                # Шаг 1: Получаем только "сырые" данные из парсера
+                raw_data = parse_aida_report(file_path, self.config, self.log_message.emit)
+                
+                if raw_data:
+                    # Шаг 2: Передаем сырые данные в анализатор
+                    category, problems_text = analyze_system(raw_data, self.config)
+                    
+                    # Шаг 3: Дополняем словарь результатами анализа
+                    raw_data['category'] = category
+                    raw_data['problems'] = problems_text
+                    
+                    self.result_ready.emit(raw_data)
+                    all_reports_data.append(raw_data)
+            
             if not self.is_running: self.log_message.emit("Процесс анализа был прерван пользователем.", "warning"); self.finished.emit(""); return
+            
             self.status_update.emit("Сохранение данных в базу...", True); save_data_to_db(all_reports_data); self.status_update.emit("Экспорт в Excel...", True)
+            
             all_data_from_db = fetch_all_data_from_db(); all_data_from_db.sort(key=lambda item: natural_sort_key(item.get('Имя файла')))
+            
             write_to_excel(all_data_from_db, output_file, self.log_message.emit); self.finished.emit(output_file)
         except Exception as e:
             self.log_message.emit(f"КРИТИЧЕСКАЯ ОШИБКА в потоке анализа: {e}", "error"); logger.error(f"Критическая ошибка в потоке AidaWorker: {e}", exc_info=True); self.finished.emit("")
-
 class DatabaseUpdateWorker(QObject):
     log_message = Signal(str, str); finished = Signal()
     def __init__(self, config, unique_id, header_to_update, new_value): super().__init__(); self.config = config; self.unique_id = unique_id; self.header = header_to_update; self.new_value = new_value
@@ -75,7 +89,6 @@ class IPUpdateWorker(QObject):
     PHYSICAL_KEYWORDS = ['ethernet', 'wi-fi', 'беспроводная', 'локальной сети']
 
     def _get_local_net_info(self):
-        """Возвращает словарь с IP, MAC и подсетью, или None."""
         self.log_message.emit("Начинаю интеллектуальный поиск сетевого адаптера...", "info")
         try:
             all_interfaces = psutil.net_if_addrs()
@@ -89,7 +102,6 @@ class IPUpdateWorker(QObject):
                 ip_addr, mac_addr = None, None
                 for addr in addresses:
                     if addr.family == socket.AF_INET and not addr.address.startswith('169.254.'): ip_addr = addr.address
-                    # psutil.AF_LINK работает на Linux/macOS, AF_PACKET на некоторых старых
                     if addr.family == psutil.AF_LINK or str(addr.family) == 'AddressFamily.AF_PACKET': mac_addr = addr.address
                 
                 if ip_addr and mac_addr:
@@ -151,7 +163,6 @@ class IPUpdateWorker(QObject):
             self.log_message.emit("Прогрев ARP-кэша...", "info"); self._warm_up_arp_cache(net_info['subnet'])
             
             arp_table = self._get_arp_table()
-            # --- ИСПРАВЛЕНИЕ: Добавляем информацию о себе в ARP-таблицу ---
             self.log_message.emit(f"Добавляю информацию о локальном хосте в ARP-таблицу: {net_info['ip']} -> {net_info['mac']}", "debug")
             arp_table[net_info['mac']] = net_info['ip']
             

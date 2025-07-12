@@ -24,7 +24,7 @@ def _calculate_statistics(data_list):
         elif category == 2: stats['cat2_upgrade'] += 1
         else: stats['cat3_ok'] += 1
         if problems_str := data.get('problems', ''):
-            problem_list = [p.strip() for p in problems_str.split(';') if "состояние хорошее" not in p.lower() and p.strip()]
+            problem_list = [p.strip() for p in problems_str.split('\n') if "состояние хорошее" not in p.lower() and p.strip()]
             stats['problem_counts'].update(problem_list)
         if bios_date_str := data.get('Дата BIOS'):
             if date_match := re.search(r'(\d{2}/\d{2}/\d{2,4})', bios_date_str):
@@ -88,7 +88,6 @@ def write_to_excel(data_list, filename, log_emitter):
         bar_chart.add_data(data, titles_from_data=True); bar_chart.set_categories(cats)
         ws_dash.add_chart(bar_chart, "H10")
 
-    # --- ИСПРАВЛЕНО: Секция Топ-5 ОПУЩЕНА НИЖЕ ---
     ws_dash['B30'] = 'Приоритетные компьютеры'; ws_dash['B30'].font = section_title_font; ws_dash.merge_cells('B30:K30')
     ws_dash['B31'] = 'Имя ПК'; ws_dash['B31'].font = header_font; ws_dash['B31'].fill = header_fill
     ws_dash.merge_cells('C31:K31'); ws_dash['C31'] = 'Основные проблемы'; ws_dash['C31'].font = header_font; ws_dash['C31'].fill = header_fill
@@ -96,7 +95,7 @@ def write_to_excel(data_list, filename, log_emitter):
     for i, pc_data in enumerate(stats['top_5_critical'], 32):
         ws_dash.cell(row=i, column=2, value=pc_data.get('Название ПК', 'N/A'))
         ws_dash.merge_cells(start_row=i, start_column=3, end_row=i, end_column=11)
-        ws_dash.cell(row=i, column=3, value=pc_data.get('problems', 'Нет данных'))
+        ws_dash.cell(row=i, column=3, value=pc_data.get('problems', 'Нет данных').replace('\n', '; '))
         cat_fill = {1: cat1_fill, 2: cat2_fill, 3: cat3_fill}.get(pc_data.get('category', 3))
         for cell_col in range(2, 12):
             cell = ws_dash.cell(row=i, column=cell_col)
@@ -106,13 +105,12 @@ def write_to_excel(data_list, filename, log_emitter):
     for col_letter, width in [('A', 2), ('B', 22), ('C', 15), ('D', 15), ('E', 15), ('F', 15), ('G', 15), ('H', 15), ('I', 15), ('J', 15), ('K', 15)]:
         ws_dash.column_dimensions[col_letter].width = width
 
-    # ОСТАЛЬНЫЕ ЛИСТЫ
     ws_main = wb.create_sheet("Все данные"); data_font = Font(name='Calibri', size=11); smart_bad_font = Font(bold=True, color="9C0006"); data_alignment = Alignment(vertical='top', wrap_text=True, horizontal='left')
     final_headers = [h for h in HEADERS_MAIN if h != '_RAW_DATA']; [final_headers.append(h) for h in HEADERS_NETWORK if h not in final_headers]
     ws_main.append(final_headers)
     for cell in ws_main[1]: cell.font = header_font; cell.fill = header_fill; cell.alignment = header_alignment; cell.border = thin_border
     for data_row in data_list:
-        ws_main.append([data_row.get(h, '') for h in final_headers]); row_idx = ws_main.max_row
+        ws_main.append([str(data_row.get(h, '')).replace('\n', '; ') for h in final_headers]); row_idx = ws_main.max_row
         category = data_row.get('category', 3); row_fill, row_font = {1: (cat1_fill, Font(color="9C0006")), 2: (cat2_fill, Font(color="9C6500")), 3: (cat3_fill, data_font)}.get(category, (None, data_font))
         for cell in ws_main[row_idx]: cell.font = row_font; cell.alignment = data_alignment; cell.border = thin_border
         if row_fill:
@@ -135,13 +133,13 @@ def write_to_excel(data_list, filename, log_emitter):
                 if data.get('internal_smart_status') == "BAD": rec_list.add("ЗАМЕНА ДИСКА!")
                 elif cat_num == 1: rec_list.add("Полная замена")
                 else:
-                    for p in str(data.get('problems', '')).lower().split('; '):
+                    for p in str(data.get('problems', '')).lower().split('\n'):
                         if 'ос' in p or 'windows 7' in p: rec_list.add("Обновить ОС")
                         elif 'ssd' in p: rec_list.add("Установить SSD")
                         elif 'озу' in p: rec_list.add("Добавить ОЗУ")
                         elif 'видеодрайвер' in p: rec_list.add("Установить видеодрайвер")
                         elif 'bios' in p: rec_list.add("Обновить BIOS (опционально)")
-                ws_analysis.append([data.get(h, '') for h in ['Имя файла', 'Название ПК', 'problems']] + [", ".join(sorted(list(rec_list))) or "Частичный апгрейд"])
+                ws_analysis.append([data.get(h, '').replace('\n', '; ') for h in ['Имя файла', 'Название ПК', 'problems']] + [", ".join(sorted(list(rec_list))) or "Частичный апгрейд"])
         ws_analysis.append([])
     for col_idx in range(1, ws_analysis.max_column + 1):
         col_letter = get_column_letter(col_idx); ws_analysis.column_dimensions[col_letter].width = max((len(str(c.value)) for c in ws_analysis[col_letter] if c.value and not isinstance(c, MergedCell)), default=20) + 2

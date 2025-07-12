@@ -1,16 +1,15 @@
-# ui/main_window.py
 import os
 import logging
 import configparser
 from functools import partial
 
-from PySide6.QtCore import QThread, Signal, QUrl, Qt, QSettings
+from PySide6.QtCore import QThread, Signal, QUrl, Qt, QSettings, QPoint, QRect
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLineEdit, QFileDialog,
                              QLabel, QProgressBar, QTableWidget, QTableWidgetItem,
                              QMainWindow, QSizePolicy, QMessageBox, QTabWidget,
-                             QMenu, QFrame, QComboBox, QCheckBox)
-from PySide6.QtGui import QDesktopServices, QIcon, QColor, QAction
+                             QMenu, QFrame, QComboBox, QCheckBox, QStatusBar)
+from PySide6.QtGui import QIcon, QColor, QAction, QDesktopServices
 
 from ui.icons import get_icon
 from ui.log_window import LogWindow
@@ -20,31 +19,78 @@ from utils.constants import HEADERS_MAIN, HEADERS_NETWORK
 from ui.details_window import DetailsWindow
 
 class MainWindow(QMainWindow):
+    # ... (весь код до create_new_table без изменений) ...
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Анализатор отчетов AIDA64")
-        self.settings = QSettings("KvartaSoft", "AidaReportAnalyzer")
-        self.setGeometry(100, 100, 1200, 800)
         
-        self.config = configparser.ConfigParser()
-        self.config.read('config.ini', encoding='utf-8')
-            
-        self.thread = None
-        self.worker = None
+        self.setWindowFlags(Qt.FramelessWindowHint)
+        self.setWindowTitle("Анализатор отчетов AIDA64"); self.setWindowIcon(get_icon("app_icon"))
+        self.settings = QSettings("KvartaSoft", "AidaReportAnalyzer"); self.setGeometry(100, 100, 1200, 800)
+        
+        self.setMouseTracking(True) 
+        self.border_margin = 5
+        self.resize_mode = None
+        self.drag_pos = None
+        self.resize_start_pos = None
+        self.resize_start_geom = None
+        
+        self.config = configparser.ConfigParser(); self.config.read('config.ini', encoding='utf-8')
+        self.thread = None; self.worker = None
         self.log_window = LogWindow(QApplication.instance().styleSheet())
-        self.last_file_path = ""
+        self.last_file_path = ""; self.all_data = {}; self.details_windows = {}
         
-        self.all_data = {}
-        self.details_windows = {}
-
+        self.central_widget = QWidget()
+        self.central_widget.setMouseTracking(True)
+        self.setCentralWidget(self.central_widget)
+        
+        self.main_layout = QVBoxLayout(self.central_widget)
+        self.main_layout.setContentsMargins(1, 1, 1, 1); self.main_layout.setSpacing(0)
+        
         self.create_widgets()
         self.setup_layout()
         self.connect_signals()
-        
         self.load_settings()
         self.auto_load_data()
-        
         logging.info("Приложение успешно инициализировано.")
+
+    def setup_layout(self):
+        title_bar = self._create_title_bar(); self.main_layout.addWidget(title_bar)
+        toolbar = self._create_toolbar(); self.main_layout.addWidget(toolbar)
+        content_widget = QWidget()
+        content_widget.setMouseTracking(True)
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(10, 10, 10, 10)
+        top_layout = QHBoxLayout(); top_layout.addWidget(QLabel("Папка с отчетами:")); top_layout.addWidget(self.reports_path_edit); top_layout.addWidget(self.select_folder_btn)
+        content_layout.addLayout(top_layout); content_layout.addWidget(self.filter_panel)
+        content_layout.addWidget(self.tabs); content_layout.addWidget(self.progress_bar)
+        self.main_layout.addWidget(content_widget)
+        self.status_bar = QStatusBar()
+        self.main_layout.addWidget(self.status_bar)
+
+    def _create_title_bar(self):
+        title_bar = QWidget(objectName="titleBar"); title_bar.setMouseTracking(True)
+        title_bar_layout = QHBoxLayout(title_bar); title_bar_layout.setContentsMargins(0, 0, 0, 0)
+        icon_label = QLabel(); icon_label.setPixmap(get_icon("app_icon").pixmap(16, 16))
+        title_label = QLabel(self.windowTitle(), objectName="titleLabel")
+        title_bar_layout.addWidget(icon_label, alignment=Qt.AlignVCenter); title_bar_layout.addWidget(title_label, alignment=Qt.AlignVCenter); title_bar_layout.addStretch()
+        btn_size = 32
+        self.minimize_btn = QPushButton(get_icon("minimize"), ""); self.minimize_btn.setFixedSize(btn_size, btn_size)
+        self.restore_btn = QPushButton(get_icon("restore"), ""); self.restore_btn.setFixedSize(btn_size, btn_size)
+        self.maximize_btn = QPushButton(get_icon("maximize"), ""); self.maximize_btn.setFixedSize(btn_size, btn_size)
+        self.close_btn = QPushButton(get_icon("close"), ""); self.close_btn.setFixedSize(btn_size, btn_size); self.close_btn.setObjectName("closeButton")
+        title_bar_layout.addWidget(self.minimize_btn); title_bar_layout.addWidget(self.restore_btn)
+        title_bar_layout.addWidget(self.maximize_btn); title_bar_layout.addWidget(self.close_btn)
+        self.update_maximize_button()
+        return title_bar
+        
+    def _create_toolbar(self):
+        toolbar = QWidget(); toolbar.setMouseTracking(True)
+        toolbar_layout = QHBoxLayout(toolbar); toolbar_layout.setContentsMargins(5, 5, 5, 5)
+        toolbar_layout.addWidget(self.start_btn); toolbar_layout.addWidget(self.stop_btn); toolbar_layout.addSpacing(20)
+        toolbar_layout.addWidget(self.update_ip_btn); toolbar_layout.addSpacing(20); toolbar_layout.addWidget(self.show_log_btn)
+        spacer = QWidget(); spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        toolbar_layout.addWidget(spacer); toolbar_layout.addWidget(self.open_file_btn)
+        return toolbar
 
     def create_widgets(self):
         self.reports_path_edit = QLineEdit(self.config.get('Settings', 'reports_directory', fallback='reports'))
@@ -52,51 +98,58 @@ class MainWindow(QMainWindow):
         self.start_btn = QPushButton("Начать анализ"); self.start_btn.setIcon(get_icon("start")); self.start_btn.setObjectName("startBtn")
         self.stop_btn = QPushButton("Остановить"); self.stop_btn.setIcon(get_icon("stop")); self.stop_btn.setEnabled(False)
         self.update_ip_btn = QPushButton("Обновить IP"); self.update_ip_btn.setIcon(get_icon("network"))
-        
-        self.filter_panel = QFrame(); self.filter_panel.setObjectName("filterPanel")
-        filter_layout = QHBoxLayout(self.filter_panel); filter_layout.setContentsMargins(5, 5, 5, 5)
+        self.filter_panel = QFrame(); self.filter_panel.setObjectName("filterPanel"); self.filter_panel.setMouseTracking(True)
+        filter_layout = QHBoxLayout(self.filter_panel); filter_layout.setContentsMargins(10, 5, 10, 5)
         self.filter_column_combo = QComboBox(); self.filter_column_combo.addItem("Поиск по всем полям")
         self.filter_edit = QLineEdit(); self.filter_edit.setPlaceholderText("Введите текст для поиска...")
         self.check_critical = QCheckBox("Крит. проблемы"); self.check_upgrade = QCheckBox("Нужен апгрейд")
         self.check_no_ssd = QCheckBox("Без SSD"); self.check_win7 = QCheckBox("Windows 7")
         self.reset_filters_btn = QPushButton("Сбросить фильтры")
-        
         filter_layout.addWidget(QLabel("Искать в:")); filter_layout.addWidget(self.filter_column_combo, 1); filter_layout.addWidget(self.filter_edit, 2); filter_layout.addStretch(1)
         filter_layout.addWidget(self.check_critical); filter_layout.addWidget(self.check_upgrade); filter_layout.addWidget(self.check_no_ssd); filter_layout.addWidget(self.check_win7)
         separator = QFrame(); separator.setFrameShape(QFrame.Shape.VLine); separator.setFrameShadow(QFrame.Shadow.Sunken)
         filter_layout.addWidget(separator); filter_layout.addWidget(self.reset_filters_btn)
-        
-        self.tabs = QTabWidget()
+        self.tabs = QTabWidget(); self.tabs.setMouseTracking(True)
         self.main_table = self.create_new_table(HEADERS_MAIN); self.network_table = self.create_new_table(HEADERS_NETWORK)
         self.tabs.addTab(self.main_table, "Общая информация"); self.tabs.addTab(self.network_table, "Сеть")
-        
         self.progress_bar = QProgressBar(); self.progress_bar.setVisible(False); self.progress_bar.setAlignment(Qt.AlignCenter)
         self.open_file_btn = QPushButton("Открыть Excel"); self.open_file_btn.setIcon(get_icon("excel")); self.open_file_btn.setEnabled(False)
         self.show_log_btn = QPushButton("Показать лог"); self.show_log_btn.setIcon(get_icon("log"))
 
     def create_new_table(self, headers):
-        table = QTableWidget(); visible_headers = [h for h in headers if h != '_RAW_DATA']
+        table = QTableWidget()
+        table.setMouseTracking(True)
+        visible_headers = [h for h in headers if h != '_RAW_DATA']
         table.setColumnCount(1 + len(visible_headers) + 1)
         table.setHorizontalHeaderItem(0, QTableWidgetItem("Ст"))
-        for i, header_text in enumerate(visible_headers, 1): table.setHorizontalHeaderItem(i, QTableWidgetItem(header_text))
-        table.setHorizontalHeaderItem(table.columnCount() - 1, QTableWidgetItem("")); table.setColumnHidden(table.columnCount() - 1, True)
-        table.setSortingEnabled(True); table.sortByColumn(table.columnCount() - 1, Qt.AscendingOrder)
-        table.setColumnWidth(0, 30); table.setEditTriggers(QTableWidget.NoEditTriggers)
-        table.setSelectionBehavior(QTableWidget.SelectRows); table.setAlternatingRowColors(False)
+        for i, header_text in enumerate(visible_headers, 1):
+            table.setHorizontalHeaderItem(i, QTableWidgetItem(header_text))
+        
+        table.setHorizontalHeaderItem(table.columnCount() - 1, QTableWidgetItem(""))
+        table.setColumnHidden(table.columnCount() - 1, True)
+        
+        table.setSortingEnabled(True)
+        table.sortByColumn(table.columnCount() - 1, Qt.AscendingOrder)
+        table.setColumnWidth(0, 30)
+        
+        # --- ИСПРАВЛЕНИЕ: Задаем ширину для колонки с моделями ОЗУ ---
+        try:
+            ram_col_index = visible_headers.index('Модели плашек ОЗУ') + 1
+            table.setColumnWidth(ram_col_index, 250)
+        except ValueError:
+            pass # Если колонки нет, ничего страшного
+
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setAlternatingRowColors(False)
         table.setContextMenuPolicy(Qt.CustomContextMenu)
         return table
 
-    def setup_layout(self):
-        main_widget = QWidget(); self.setCentralWidget(main_widget); main_layout = QVBoxLayout(main_widget)
-        top_layout = QHBoxLayout(); top_layout.addWidget(QLabel("Папка с отчетами:")); top_layout.addWidget(self.reports_path_edit); top_layout.addWidget(self.select_folder_btn)
-        main_layout.addLayout(top_layout); main_layout.addWidget(self.filter_panel); main_layout.addWidget(self.tabs); main_layout.addWidget(self.progress_bar)
-        self.setStatusBar(QMainWindow.statusBar(self)); toolbar = self.addToolBar("Controls"); toolbar.setMovable(False)
-        toolbar.addWidget(self.start_btn); toolbar.addWidget(self.stop_btn); toolbar.addSeparator()
-        toolbar.addWidget(self.update_ip_btn); toolbar.addSeparator(); toolbar.addWidget(self.show_log_btn)
-        spacer = QWidget(); spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        toolbar.addWidget(spacer); toolbar.addWidget(self.open_file_btn)
-    
     def connect_signals(self):
+        self.minimize_btn.clicked.connect(self.showMinimized)
+        self.restore_btn.clicked.connect(self.toggle_fullscreen)
+        self.maximize_btn.clicked.connect(self.toggle_fullscreen)
+        self.close_btn.clicked.connect(self.close)
         self.select_folder_btn.clicked.connect(self.select_folder); self.start_btn.clicked.connect(self.start_analysis)
         self.stop_btn.clicked.connect(self.stop_analysis); self.update_ip_btn.clicked.connect(self.start_ip_update)
         self.open_file_btn.clicked.connect(self.open_excel_file); self.show_log_btn.clicked.connect(self.log_window.show)
@@ -109,6 +162,89 @@ class MainWindow(QMainWindow):
             table.cellDoubleClicked.connect(self.show_details_by_click)
             table.customContextMenuRequested.connect(self.show_table_context_menu); table.itemChanged.connect(self.handle_item_changed)
     
+    def toggle_fullscreen(self):
+        if self.isMaximized(): self.showNormal()
+        else: self.showMaximized()
+        
+    def event(self, event):
+        if event.type() == event.Type.WindowStateChange: self.update_maximize_button()
+        return super().event(event)
+        
+    def update_maximize_button(self):
+        is_max = self.isMaximized()
+        self.maximize_btn.setVisible(not is_max)
+        self.restore_btn.setVisible(is_max)
+
+    # --- НОВАЯ СЕКЦИЯ: ПОЛНОСТЬЮ ПЕРЕРАБОТАННАЯ ЛОГИКА УПРАВЛЕНИЯ ОКНОМ ---
+    def get_edge(self, pos):
+        if self.isMaximized(): return None
+        rect = self.rect()
+        left = pos.x() >= rect.left() and pos.x() < rect.left() + self.border_margin
+        right = pos.x() > rect.right() - self.border_margin and pos.x() <= rect.right()
+        top = pos.y() >= rect.top() and pos.y() < rect.top() + self.border_margin
+        bottom = pos.y() > rect.bottom() - self.border_margin and pos.y() <= rect.bottom()
+
+        if top and left: return "topleft"
+        if top and right: return "topright"
+        if bottom and left: return "bottomleft"
+        if bottom and right: return "bottomright"
+        if top: return "top"
+        if bottom: return "bottom"
+        if left: return "left"
+        if right: return "right"
+        return None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.resize_mode = self.get_edge(event.pos())
+            if self.resize_mode:
+                self.resize_start_pos = event.globalPosition().toPoint()
+                self.resize_start_geom = self.geometry()
+            else:
+                self.drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        # Действия, когда кнопка мыши ЗАЖАТА
+        if event.buttons() == Qt.LeftButton:
+            if self.resize_mode:
+                delta = event.globalPosition().toPoint() - self.resize_start_pos
+                new_geom = QRect(self.resize_start_geom)
+
+                if "top" in self.resize_mode: new_geom.setTop(self.resize_start_geom.top() + delta.y())
+                if "bottom" in self.resize_mode: new_geom.setBottom(self.resize_start_geom.bottom() + delta.y())
+                if "left" in self.resize_mode: new_geom.setLeft(self.resize_start_geom.left() + delta.x())
+                if "right" in self.resize_mode: new_geom.setRight(self.resize_start_geom.right() + delta.x())
+                
+                if new_geom.width() < self.minimumSizeHint().width(): new_geom.setWidth(self.minimumSizeHint().width())
+                if new_geom.height() < self.minimumSizeHint().height(): new_geom.setHeight(self.minimumSizeHint().height())
+                
+                self.setGeometry(new_geom)
+            
+            elif self.drag_pos:
+                self.move(event.globalPosition().toPoint() - self.drag_pos)
+        
+        # Действия при простом НАВЕДЕНИИ (кнопка не зажата)
+        else:
+            edge = self.get_edge(event.pos())
+            if edge:
+                if edge in ["top", "bottom"]: self.setCursor(Qt.SizeVerCursor)
+                elif edge in ["left", "right"]: self.setCursor(Qt.SizeHorCursor)
+                elif edge in ["topleft", "bottomright"]: self.setCursor(Qt.SizeFDiagCursor)
+                else: self.setCursor(Qt.SizeBDiagCursor)
+            else:
+                self.unsetCursor()
+        
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self.drag_pos = None
+        self.resize_mode = None
+        self.unsetCursor()
+        super().mouseReleaseEvent(event)
+    # --- КОНЕЦ НОВОЙ СЕКЦИИ ---
+        
+    def statusBar(self): return self.status_bar
     def start_ip_update(self):
         logging.info("Запрошено обновление IP-адресов."); self.start_btn.setEnabled(False); self.update_ip_btn.setEnabled(False)
         self.thread = QThread(); self.worker = IPUpdateWorker(); self.worker.moveToThread(self.thread)
@@ -116,11 +252,9 @@ class MainWindow(QMainWindow):
         self.worker.finished.connect(self.ip_update_finished); self.worker.finished.connect(self.thread.quit)
         self.thread.finished.connect(self.worker.deleteLater); self.thread.finished.connect(self.thread.deleteLater); self.thread.start()
         self.statusBar().showMessage("Запущено сканирование сети для обновления IP...")
-
     def ip_update_finished(self):
         logging.info("Процесс обновления IP-адресов завершен."); self.statusBar().showMessage("Обновление IP-адресов завершено. Обновляю таблицу...", 5000)
         self.auto_load_data(); self.start_btn.setEnabled(True); self.update_ip_btn.setEnabled(True)
-
     def auto_load_data(self):
         self.statusBar().showMessage("Загрузка данных из базы...")
         valid_data = [row for row in fetch_all_data_from_db() if row.get("Имя файла")]
@@ -139,7 +273,6 @@ class MainWindow(QMainWindow):
         else: self.statusBar().showMessage("База данных пуста или не содержит валидных записей.", 5000)
         output_file = self.config.get('Settings', 'output_filename', fallback='system_analysis.xlsx')
         if os.path.exists(output_file): self.open_file_btn.setEnabled(True); self.last_file_path = output_file
-
     def _populate_table_row(self, table, row_idx, data_row):
         category = data_row.get('category', 3)
         colors = {1: (QColor("#5c2c2c"), QColor("#f0c0c0")), 2: (QColor("#5c532c"), QColor("#f0e8c0")), 3: (None, QColor("#dcdcdc"))}
@@ -154,46 +287,29 @@ class MainWindow(QMainWindow):
             elif col_idx == table.columnCount() - 1: item.setData(Qt.DisplayRole, category)
             else: item.setText(str(data_row.get(table.horizontalHeaderItem(col_idx).text(), '')))
             table.setItem(row_idx, col_idx, item)
-            
-    # --- ВОЗВРАЩЕННЫЕ МЕТОДЫ ---
     def show_details_by_click(self, row, column):
-        table = self.sender()
-        filename = self.get_filename_from_row(table, row)
-        if filename in self.all_data:
-            self.show_details_window(filename)
-
+        table = self.sender(); filename = self.get_filename_from_row(table, row)
+        if filename in self.all_data: self.show_details_window(filename)
     def get_filename_from_row(self, table, row):
         for i in range(table.columnCount()):
             if table.horizontalHeaderItem(i) and table.horizontalHeaderItem(i).text() == "Имя файла":
-                item = table.item(row, i)
-                return item.text() if item else None
+                item = table.item(row, i); return item.text() if item else None
         return None
-        
     def show_details_window(self, filename):
-        if filename in self.details_windows:
-            self.details_windows[filename].activateWindow()
-            self.details_windows[filename].raise_()
-            return
+        if filename in self.details_windows: self.details_windows[filename].activateWindow(); self.details_windows[filename].raise_(); return
         if filename in self.all_data:
             details_win = DetailsWindow(self.all_data[filename], self.on_details_window_close, QApplication.instance().styleSheet(), self)
-            self.details_windows[filename] = details_win
-            details_win.show()
-
+            self.details_windows[filename] = details_win; details_win.show()
     def on_details_window_close(self, filename):
-        if filename in self.details_windows:
-            del self.details_windows[filename]
-            
-    # --- КОНЕЦ ВОЗВРАЩЕННЫХ МЕТОДОВ ---
-
+        if filename in self.details_windows: del self.details_windows[filename]
     def add_table_row(self, data_row):
-        filename = data_row.get("Имя файла")
+        filename = data_row.get("Имя файла");
         if not filename: return
         self.all_data[filename] = data_row
         for table in [self.main_table, self.network_table]:
             table.blockSignals(True)
             try: row_pos = table.rowCount(); table.insertRow(row_pos); self._populate_table_row(table, row_pos, data_row)
             finally: table.blockSignals(False)
-
     def handle_item_changed(self, item):
         active_table = item.tableWidget(); row, column = item.row(), item.column()
         filename = self.get_filename_from_row(active_table, row);
@@ -208,7 +324,6 @@ class MainWindow(QMainWindow):
         self.thread.finished.connect(self.thread.deleteLater); self.worker.log_message.connect(self.log_window.add_log)
         self.thread.started.connect(self.worker.run); self.thread.start()
         if filename in self.all_data: self.all_data[filename][header_to_update] = new_value
-
     def start_analysis(self):
         reports_dir = self.reports_path_edit.text()
         if not os.path.isdir(reports_dir): QMessageBox.warning(self, "Ошибка", f"Папка '{reports_dir}' не найдена!"); return
@@ -224,10 +339,8 @@ class MainWindow(QMainWindow):
         self.worker.finished.connect(self.thread.quit); self.worker.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater); self.thread.start()
         self.statusBar().showMessage("Анализ запущен...")
-
     def stop_analysis(self):
         if self.worker and hasattr(self.worker, 'is_running'): self.worker.is_running = False; self.stop_btn.setEnabled(False); self.statusBar().showMessage("Остановка анализа...")
-
     def analysis_finished(self, output_filepath):
         self.progress_bar.setVisible(False)
         for w in [self.tabs, self.filter_panel, self.start_btn, self.update_ip_btn]: w.setEnabled(True)
@@ -238,7 +351,6 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(status_message, 5000)
         if output_filepath and os.path.exists(output_filepath): self.last_file_path = output_filepath; self.open_file_btn.setEnabled(True)
         if self.thread is not None: self.thread.quit(); self.thread.wait()
-
     def update_status_bar(self, message, set_indeterminate): self.statusBar().showMessage(message); self.progress_bar.setRange(0, 0 if set_indeterminate else 100)
     def update_progress(self, current, total): self.progress_bar.setMaximum(total); self.progress_bar.setValue(current); self.statusBar().showMessage(f"Обработка файла {current} из {total}...")
     def show_table_context_menu(self, position):
